@@ -1,4 +1,4 @@
-"""Local worker handler for ml_experiment — trains sklearn models with cross-validation."""
+"""Handler for ml_experiment tasks — trains and evaluates a single ML model with cross-validation."""
 
 import time
 import json
@@ -6,20 +6,40 @@ from resource_guard import safe_n_jobs, safe_dataset_size
 
 
 def handle(task: dict, job: dict) -> str:
+    """
+    Train and evaluate one ML experiment based on the task payload.
+    Uses k-fold cross-validation on 75K rows — actually compute-intensive.
+
+    Expected task_payload keys:
+        experiment_type: str
+        dataset_name: str
+        target: str
+        task_category: str (regression | classification)
+        features: list[str]
+        cv_folds: int (default 5)
+        params: dict
+    """
     from sklearn.model_selection import train_test_split, cross_validate
     from sklearn.metrics import (
         r2_score, mean_squared_error, mean_absolute_error,
         accuracy_score, f1_score, precision_score, recall_score,
     )
-    from sklearn.linear_model import LinearRegression, Ridge, LogisticRegression
+    from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet, LogisticRegression
     from sklearn.tree import DecisionTreeRegressor, DecisionTreeClassifier
     from sklearn.ensemble import (
         RandomForestRegressor, RandomForestClassifier,
         GradientBoostingRegressor, GradientBoostingClassifier,
+        ExtraTreesRegressor, ExtraTreesClassifier,
+        AdaBoostRegressor, AdaBoostClassifier,
     )
+    from sklearn.neighbors import KNeighborsRegressor, KNeighborsClassifier
+    from sklearn.naive_bayes import GaussianNB
+    from sklearn.neural_network import MLPClassifier
     import numpy as np
+
     from datasets import get_dataset, load_external_dataset
 
+    # Parse task payload
     payload = task.get("task_payload", {})
     if isinstance(payload, str):
         try:
@@ -48,46 +68,129 @@ def handle(task: dict, job: dict) -> str:
     if not features:
         features = meta["all_features"]
 
-    # Limit dataset size based on available RAM to prevent crashes
+    # Planner/JSON may use string keys; OpenML columns are normalized to str in datasets.load_openml
+    features = [str(f) for f in features]
+    target = str(target)
+
+    sample = rows[0] if rows else {}
+    missing = [f for f in features if f not in sample]
+    if missing:
+        return (
+            f"Dataset column mismatch: features not in rows — {missing[:5]}"
+            f"{'…' if len(missing) > 5 else ''}. Available keys: {list(sample.keys())[:20]}"
+        )
+    if target not in sample:
+        return f"Target column '{target}' not found in dataset rows. Keys: {list(sample.keys())[:30]}"
+
     max_rows = safe_dataset_size(len(rows))
     if max_rows < len(rows):
         import random
         rows = random.sample(rows, max_rows)
 
-    X = np.array([[row[f] for f in features] for row in rows])
-    y = np.array([row[target] for row in rows])
+    def _cell(row, key):
+        return row[key] if key in row else row[str(key)]
 
+    # Build X and y as numpy arrays for speed
+    X = np.array([[_cell(row, f) for f in features] for row in rows])
+    y = np.array([_cell(row, target) for row in rows])
+
+    # Train/test split (hold out 20% for final eval after CV)
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42
     )
 
+    # Model registry
     MODEL_MAP = {
+        # Regression
         "linear_regression": lambda p: LinearRegression(),
-        "ridge_regression": lambda p: Ridge(alpha=p.get("alpha", 1.0)),
+        "ridge_regression": lambda p: Ridge(
+            alpha=p.get("alpha", 1.0),
+        ),
         "decision_tree_regressor": lambda p: DecisionTreeRegressor(
-            max_depth=p.get("max_depth", 5), random_state=42),
+            max_depth=p.get("max_depth", 5), random_state=42
+        ),
         "random_forest_regressor": lambda p: RandomForestRegressor(
             n_estimators=p.get("n_estimators", 100),
-            max_depth=p.get("max_depth", 10), random_state=42, n_jobs=safe_n_jobs()),
+            max_depth=p.get("max_depth", 10),
+            random_state=42,
+            n_jobs=safe_n_jobs(),
+        ),
         "gradient_boosting_regressor": lambda p: GradientBoostingRegressor(
             n_estimators=p.get("n_estimators", 200),
             max_depth=p.get("max_depth", 5),
-            learning_rate=p.get("learning_rate", 0.1), random_state=42),
+            learning_rate=p.get("learning_rate", 0.1),
+            subsample=p.get("subsample", 1.0),
+            random_state=42,
+        ),
+        "lasso_regression": lambda p: Lasso(
+            alpha=p.get("alpha", 1.0),
+        ),
+        "elasticnet_regression": lambda p: ElasticNet(
+            alpha=p.get("alpha", 0.5),
+            l1_ratio=p.get("l1_ratio", 0.5),
+        ),
+        "extra_trees_regressor": lambda p: ExtraTreesRegressor(
+            n_estimators=p.get("n_estimators", 300),
+            max_depth=p.get("max_depth", 15),
+            random_state=42,
+            n_jobs=safe_n_jobs(),
+        ),
+        "adaboost_regressor": lambda p: AdaBoostRegressor(
+            n_estimators=p.get("n_estimators", 200),
+            learning_rate=p.get("learning_rate", 0.1),
+            random_state=42,
+        ),
+        "knn_regressor": lambda p: KNeighborsRegressor(
+            n_neighbors=p.get("n_neighbors", 5),
+            n_jobs=safe_n_jobs(),
+        ),
+        # Classification
         "logistic_regression": lambda p: LogisticRegression(
-            max_iter=p.get("max_iter", 2000), random_state=42),
+            max_iter=p.get("max_iter", 2000), random_state=42
+        ),
         "logistic_regression_l1": lambda p: LogisticRegression(
             penalty="l1", solver="saga",
             max_iter=p.get("max_iter", 2000),
-            C=p.get("C", 0.5), random_state=42),
+            C=p.get("C", 0.5),
+            random_state=42,
+        ),
         "decision_tree_classifier": lambda p: DecisionTreeClassifier(
-            max_depth=p.get("max_depth", 5), random_state=42),
+            max_depth=p.get("max_depth", 5), random_state=42
+        ),
         "random_forest_classifier": lambda p: RandomForestClassifier(
             n_estimators=p.get("n_estimators", 100),
-            max_depth=p.get("max_depth", 10), random_state=42, n_jobs=safe_n_jobs()),
+            max_depth=p.get("max_depth", 10),
+            random_state=42,
+            n_jobs=safe_n_jobs(),
+        ),
         "gradient_boosting_classifier": lambda p: GradientBoostingClassifier(
             n_estimators=p.get("n_estimators", 200),
             max_depth=p.get("max_depth", 5),
-            learning_rate=p.get("learning_rate", 0.1), random_state=42),
+            learning_rate=p.get("learning_rate", 0.1),
+            subsample=p.get("subsample", 1.0),
+            random_state=42,
+        ),
+        "knn_classifier": lambda p: KNeighborsClassifier(
+            n_neighbors=p.get("n_neighbors", 5),
+            n_jobs=safe_n_jobs(),
+        ),
+        "gaussian_nb": lambda p: GaussianNB(),
+        "extra_trees_classifier": lambda p: ExtraTreesClassifier(
+            n_estimators=p.get("n_estimators", 300),
+            max_depth=p.get("max_depth", 15),
+            random_state=42,
+            n_jobs=safe_n_jobs(),
+        ),
+        "adaboost_classifier": lambda p: AdaBoostClassifier(
+            n_estimators=p.get("n_estimators", 200),
+            learning_rate=p.get("learning_rate", 0.1),
+            random_state=42,
+        ),
+        "mlp_classifier": lambda p: MLPClassifier(
+            hidden_layer_sizes=tuple(p.get("hidden_layer_sizes", [100, 50])),
+            max_iter=p.get("max_iter", 500),
+            random_state=42,
+        ),
     }
 
     model_factory = MODEL_MAP.get(experiment_type)
@@ -96,8 +199,9 @@ def handle(task: dict, job: dict) -> str:
 
     model = model_factory(params)
 
-    # Cross-validation (the heavy part)
+    # ── Cross-validation (the heavy part) ──
     cv_start = time.time()
+
     if task_category == "regression":
         cv_scoring = ["r2", "neg_mean_squared_error", "neg_mean_absolute_error"]
     else:
@@ -105,18 +209,21 @@ def handle(task: dict, job: dict) -> str:
 
     cv_results = cross_validate(
         model, X_train, y_train,
-        cv=cv_folds, scoring=cv_scoring,
-        return_train_score=True, n_jobs=safe_n_jobs(),
+        cv=cv_folds,
+        scoring=cv_scoring,
+        return_train_score=True,
+        n_jobs=safe_n_jobs(),
     )
     cv_time = round(time.time() - cv_start, 3)
 
-    # Final fit + test eval
+    # ── Final model fit on full training set + test eval ──
     train_start = time.time()
     model.fit(X_train, y_train)
     train_time = round(time.time() - train_start, 3)
 
     y_pred = model.predict(X_test)
 
+    # ── Metrics ──
     if task_category == "regression":
         r2 = round(r2_score(y_test, y_pred), 4)
         mse = round(mean_squared_error(y_test, y_pred), 4)
@@ -124,15 +231,21 @@ def handle(task: dict, job: dict) -> str:
         cv_r2_mean = round(float(np.mean(cv_results["test_r2"])), 4)
         cv_r2_std = round(float(np.std(cv_results["test_r2"])), 4)
         cv_mse_mean = round(float(-np.mean(cv_results["test_neg_mean_squared_error"])), 4)
+
         primary_metric_name = "r2"
         primary_metric_value = r2
         metrics_text = (
-            f"- **R² Score:** {r2}\n- **MSE:** {mse}\n- **MAE:** {mae}\n"
+            f"- **R² Score:** {r2}\n"
+            f"- **MSE:** {mse}\n"
+            f"- **MAE:** {mae}\n"
             f"- **CV R² (mean +/- std):** {cv_r2_mean} +/- {cv_r2_std}\n"
             f"- **CV MSE (mean):** {cv_mse_mean}"
         )
-        metrics_json = {"r2": r2, "mse": mse, "mae": mae,
-                        "cv_r2_mean": cv_r2_mean, "cv_r2_std": cv_r2_std, "cv_mse_mean": cv_mse_mean}
+        metrics_json = {
+            "r2": r2, "mse": mse, "mae": mae,
+            "cv_r2_mean": cv_r2_mean, "cv_r2_std": cv_r2_std,
+            "cv_mse_mean": cv_mse_mean,
+        }
     else:
         acc = round(accuracy_score(y_test, y_pred), 4)
         f1 = round(f1_score(y_test, y_pred, average="weighted"), 4)
@@ -141,21 +254,30 @@ def handle(task: dict, job: dict) -> str:
         cv_f1_mean = round(float(np.mean(cv_results["test_f1_weighted"])), 4)
         cv_f1_std = round(float(np.std(cv_results["test_f1_weighted"])), 4)
         cv_acc_mean = round(float(np.mean(cv_results["test_accuracy"])), 4)
+
         primary_metric_name = "f1"
         primary_metric_value = f1
         metrics_text = (
-            f"- **Accuracy:** {acc}\n- **F1 Score:** {f1}\n"
-            f"- **Precision:** {prec}\n- **Recall:** {rec}\n"
+            f"- **Accuracy:** {acc}\n"
+            f"- **F1 Score:** {f1}\n"
+            f"- **Precision:** {prec}\n"
+            f"- **Recall:** {rec}\n"
             f"- **CV F1 (mean +/- std):** {cv_f1_mean} +/- {cv_f1_std}\n"
             f"- **CV Accuracy (mean):** {cv_acc_mean}"
         )
-        metrics_json = {"accuracy": acc, "f1": f1, "precision": prec, "recall": rec,
-                        "cv_f1_mean": cv_f1_mean, "cv_f1_std": cv_f1_std, "cv_acc_mean": cv_acc_mean}
+        metrics_json = {
+            "accuracy": acc, "f1": f1, "precision": prec, "recall": rec,
+            "cv_f1_mean": cv_f1_mean, "cv_f1_std": cv_f1_std,
+            "cv_acc_mean": cv_acc_mean,
+        }
 
+    # Friendly model name
     model_display = type(model).__name__
     params_display = ", ".join(f"{k}={v}" for k, v in params.items()) if params else "defaults"
+
     total_time = round(cv_time + train_time, 3)
 
+    # Build structured JSON for aggregator
     result_data = {
         "model_type": experiment_type,
         "model_display": model_display,
@@ -176,6 +298,7 @@ def handle(task: dict, job: dict) -> str:
         **metrics_json,
     }
 
+    # Summary text
     summary = (
         f"## Experiment: {model_display}\n\n"
         f"**Model:** {model_display}({params_display})\n"
