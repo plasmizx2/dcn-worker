@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""
-DCN Worker — desktop GUI (local HTTP server + browser UI).
-
-Run: python app.py
-Opens http://127.0.0.1:7777 — set server URL and worker name, then Start.
-
-For headless CLI usage use run.py instead.
-"""
+"""DCN Worker — local desktop GUI (browser at http://127.0.0.1:7777)."""
 
 import os
 import sys
@@ -32,7 +25,7 @@ GUI_PORT = 7777
 
 # --- Shared State ---
 state = {
-    "status": "offline",       # offline, connecting, setting_up, idle, working, disconnected, error
+    "status": "offline",       # offline, connecting, setting_up, idle, working, stopping, disconnected, error
     "current_task": None,
     "tasks_completed": 0,
     "total_earnings": 0.0,
@@ -68,10 +61,14 @@ class WorkerEngine:
         self.worker_name = ""
         self.task_types = []
         self.thread = None
+        self._hb_thread = None
         self._audio_handler = None
         self._sentiment_handler = None
 
     def start(self, server_url, worker_name, task_types):
+        if self.thread is not None and self.thread.is_alive():
+            add_log("Worker is already running — use Stop first.", "warn")
+            return False
         self.server_url = server_url.rstrip("/")
         self.worker_name = worker_name
         self.task_types = task_types
@@ -81,12 +78,21 @@ class WorkerEngine:
             state["total_earnings"] = 0.0
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
-        self._hb_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
-        self._hb_thread.start()
+        if self._hb_thread is None or not self._hb_thread.is_alive():
+            self._hb_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+            self._hb_thread.start()
+        return True
 
     def stop(self):
         with state_lock:
             state["running"] = False
+        set_status("stopping")
+        add_log("Stop requested — shutting down…", "warn")
+
+    def _idle_if_still_running(self):
+        """Avoid overwriting 'stopping' with 'idle' while the user has requested stop."""
+        if state["running"]:
+            set_status("idle")
 
     def _heartbeat_loop(self):
         """Send heartbeat every 15s independently of task processing."""
@@ -252,8 +258,10 @@ class WorkerEngine:
                 if not job:
                     add_log(f"Could not fetch job {job_id[:8]}", "error")
                     self._fail(task_id)
-                    set_status("idle")
                     with state_lock: state["current_task"] = None
+                    if not state["running"]:
+                        break
+                    self._idle_if_still_running()
                     continue
 
                 task_type = job.get("task_type", "")
@@ -261,8 +269,10 @@ class WorkerEngine:
                 if not handler:
                     add_log(f"No handler for: {task_type}", "error")
                     self._fail(task_id)
-                    set_status("idle")
                     with state_lock: state["current_task"] = None
+                    if not state["running"]:
+                        break
+                    self._idle_if_still_running()
                     continue
 
                 if isinstance(task.get("task_payload"), str):
@@ -291,9 +301,11 @@ class WorkerEngine:
                     self._fail(task_id)
 
                 with state_lock: state["current_task"] = None
-                set_status("idle")
+                if not state["running"]:
+                    break
+                self._idle_if_still_running()
             else:
-                set_status("idle")
+                self._idle_if_still_running()
                 for _ in range(10):
                     if not state["running"]:
                         break
@@ -482,7 +494,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
 <script>
   let isRunning = false;
-  let lastLogCount = 0;
+  let lastLogJson = '';
   let startTime = null;
 
   async function init() {
@@ -517,13 +529,17 @@ HTML_PAGE = """<!DOCTYPE html>
       const name = document.getElementById('workerName').value.trim();
       if (!url || !name) { alert('Fill in server URL and worker name'); return; }
       startTime = Date.now();
-      await fetch('/api/start', {
+      const r = await fetch('/api/start', {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
         body: JSON.stringify({server_url: url, worker_name: name})
       });
+      const body = r.ok ? await r.json().catch(() => ({})) : {};
+      if (r.ok && body.started) isRunning = true;
+      else { startTime = null; isRunning = false; }
     } else {
       startTime = null;
+      isRunning = false;
       await fetch('/api/stop', {method:'POST'});
     }
   }
@@ -532,28 +548,35 @@ HTML_PAGE = """<!DOCTYPE html>
     offline:      {dot:'', text:'Offline'},
     connecting:   {dot:'warn', text:'Connecting...'},
     setting_up:   {dot:'warn', text:'Setting Up...'},
-    idle:         {dot:'online', text:'Online - Waiting'},
+    idle:         {dot:'online', text:'Online — waiting'},
     working:      {dot:'working', text:'Processing'},
+    stopping:     {dot:'warn', text:'Stopping…'},
     disconnected: {dot:'error', text:'Disconnected'},
     error:        {dot:'error', text:'Error'},
   };
 
   async function pollState() {
     try {
-      const s = await (await fetch('/api/state')).json();
+      const res = await fetch('/api/state', { cache: 'no-store' });
+      if (!res.ok) return;
+      const s = await res.json();
       const sm = STATUS_MAP[s.status] || STATUS_MAP.offline;
 
       document.getElementById('statusDot').className = 'status-dot ' + sm.dot;
       document.getElementById('statusText').textContent = sm.text;
       document.getElementById('taskCount').textContent = s.tasks_completed;
       document.getElementById('earnings').textContent = '$' + s.total_earnings.toFixed(2);
-      document.getElementById('currentTask').textContent = s.current_task ? 'Working on: ' + s.current_task : (s.running ? 'Waiting for tasks...' : '');
+      document.getElementById('currentTask').textContent = s.current_task
+        ? 'Working on: ' + s.current_task
+        : (s.running ? 'Waiting for tasks…' : '');
       document.getElementById('workerIdDisplay').textContent = s.worker_id ? 'ID: ' + s.worker_id.substring(0,8) + '...' : '';
 
-      if (s.tasks_completed > 0 && startTime) {
-        const mins = (Date.now() - startTime) / 60000;
+      if (s.tasks_completed > 0 && startTime && s.running) {
+        const mins = Math.max((Date.now() - startTime) / 60000, 1 / 60);
         const rate = (s.total_earnings / mins).toFixed(3);
         document.getElementById('earningRate').textContent = '$' + rate + '/min';
+      } else {
+        document.getElementById('earningRate').textContent = '';
       }
 
       isRunning = s.running;
@@ -571,18 +594,29 @@ HTML_PAGE = """<!DOCTYPE html>
         btn.className = 'btn-start';
         urlInput.disabled = false;
         nameInput.disabled = false;
+        startTime = null;
       }
 
-      if (s.logs.length !== lastLogCount) {
+      const logJson = JSON.stringify(s.logs || []);
+      if (logJson !== lastLogJson) {
         const box = document.getElementById('logBox');
-        const wasAtBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 30;
-        box.innerHTML = s.logs.map(l =>
-          `<div class="log-line ${l.tag}"><span class="ts">[${l.time}]</span> ${l.msg}</div>`
+        const wasAtBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+        const lines = (s.logs || []).map(l =>
+          `<div class="log-line ${l.tag}"><span class="ts">[${l.time}]</span> ${escapeHtml(l.msg)}</div>`
         ).join('');
+        box.innerHTML = lines || '<div class="log-line info"><span class="ts">[--:--:--]</span> No log entries yet.</div>';
         if (wasAtBottom) box.scrollTop = box.scrollHeight;
-        lastLogCount = s.logs.length;
+        lastLogJson = logJson;
       }
-    } catch(e) {}
+    } catch (e) {
+      console.warn('pollState failed', e);
+    }
+  }
+
+  function escapeHtml(text) {
+    const d = document.createElement('div');
+    d.textContent = text;
+    return d.innerHTML;
   }
 
   init();
@@ -598,6 +632,7 @@ class GUIHandler(BaseHTTPRequestHandler):
     def _json(self, data, code=200):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
@@ -648,8 +683,8 @@ class GUIHandler(BaseHTTPRequestHandler):
                 json.dump({"server_url": server_url, "worker_name": worker_name}, f, indent=2)
 
             hw = hardware.detect()
-            engine.start(server_url, worker_name, hw["supported_task_types"])
-            self._json({"started": True})
+            started = engine.start(server_url, worker_name, hw["supported_task_types"])
+            self._json({"started": bool(started)})
 
         elif self.path == "/api/stop":
             engine.stop()

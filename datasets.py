@@ -1,15 +1,17 @@
 """
-Dataset loader for ml_experiment tasks (worker copy).
+Dataset loader for ml_experiment tasks.
 
 Supports three sources:
   - built_in: synthetic datasets generated locally (zero network deps)
   - openml:   real-world datasets fetched via the OpenML API
   - csv_url:  any public CSV file fetched by URL
+
+Built-in datasets are sized to be genuinely compute-intensive for sklearn
+models (50k-100k rows, 15+ features, polynomial interactions).
 """
 
 import random
 import math
-import csv
 import io
 import logging
 
@@ -215,6 +217,7 @@ _external_cache: dict[str, tuple[list[dict], dict]] = {}
 
 
 def _infer_task_category(y_values: list, target_name: str) -> str:
+    """Guess regression vs classification from target values."""
     unique = set(y_values[:5000])
     if len(unique) <= 30:
         return "classification"
@@ -223,37 +226,13 @@ def _infer_task_category(y_values: list, target_name: str) -> str:
     return "classification"
 
 
-def _numeric_columns(rows: list[dict]) -> list[str]:
-    if not rows:
-        return []
-    sample = rows[:200]
-    numeric = []
-    for col in rows[0].keys():
-        try:
-            for r in sample:
-                float(r[col])
-            numeric.append(col)
-        except (ValueError, TypeError, KeyError):
-            continue
-    return numeric
+def load_openml(dataset_id: str | int, target: str | None = None) -> tuple[list[dict], dict]:
+    """Fetch a dataset from OpenML by numeric ID. Returns (rows, metadata).
 
-
-def _coerce_rows_numeric(rows: list[dict], features: list[str], target: str) -> list[dict]:
-    cols = set(features) | {target}
-    clean = []
-    for r in rows:
-        try:
-            clean.append({c: float(r[c]) for c in cols})
-        except (ValueError, TypeError, KeyError):
-            continue
-    return clean
-
-
-def load_openml(dataset_id: str | int) -> tuple[list[dict], dict]:
-    cache_key = f"openml:{dataset_id}"
-    if cache_key in _external_cache:
-        return _external_cache[cache_key]
-
+    Non-numeric feature columns are label-encoded so classification datasets
+    with mostly categorical inputs (e.g. monks-problems) still have usable features.
+    """
+    import pandas as pd
     import openml
 
     ds = openml.datasets.get_dataset(
@@ -263,40 +242,70 @@ def load_openml(dataset_id: str | int) -> tuple[list[dict], dict]:
         download_features_meta_data=True,
     )
 
-    X, y, _, attr_names = ds.get_data(dataset_format="dataframe")
+    X, y, _, _ = ds.get_data(dataset_format="dataframe")
 
-    target = ds.default_target_attribute or X.columns[-1]
-    if target in X.columns:
+    default_t = ds.default_target_attribute
+    if isinstance(default_t, list):
+        default_t = default_t[0] if default_t else None
+    resolved_target = target or default_t
+    if resolved_target is None and len(X.columns):
+        resolved_target = X.columns[-1]
+    if resolved_target is None:
+        raise ValueError(f"OpenML dataset {dataset_id} has no target column")
+
+    if resolved_target in X.columns:
         df = X.copy()
     else:
         df = X.copy()
-        df[target] = y
+        df[resolved_target] = y
 
-    numeric_cols = list(df.select_dtypes(include=["number"]).columns)
-    if target not in numeric_cols:
-        numeric_cols.append(target)
+    # JSONB task payloads and sklearn need stable string column names (avoid attr1 KeyErrors)
+    df = df.rename(columns={c: str(c) for c in df.columns})
+    resolved_target = str(resolved_target)
 
-    features = [c for c in numeric_cols if c != target]
-    if not features:
-        raise ValueError(f"OpenML dataset {dataset_id} has no numeric feature columns")
+    if resolved_target not in df.columns:
+        raise ValueError(
+            f"Target column '{resolved_target}' not found in OpenML dataset {dataset_id}"
+        )
 
-    df = df[features + [target]].dropna()
+    feature_cols = [str(c) for c in df.columns if str(c) != resolved_target]
+    if not feature_cols:
+        raise ValueError(f"OpenML dataset {dataset_id} has no feature columns")
 
-    if len(df) > MAX_ROWS:
-        df = df.sample(n=MAX_ROWS, random_state=42)
+    cache_key = f"openml:{dataset_id}:{resolved_target}"
+    if cache_key in _external_cache:
+        return _external_cache[cache_key]
 
-    rows = df.to_dict("records")
-    for r in rows:
-        for c in features + [target]:
-            r[c] = float(r[c])
+    work = df[feature_cols + [resolved_target]].dropna(how="any")
+    if work.empty:
+        raise ValueError(f"OpenML dataset {dataset_id} has no rows after dropping NaNs")
 
-    y_vals = [r[target] for r in rows]
-    task_category = _infer_task_category(y_vals, target)
+    if len(work) > MAX_ROWS:
+        work = work.sample(n=MAX_ROWS, random_state=42)
+
+    # Infer regression vs classification from target (before encoding)
+    y_series = work[resolved_target]
+    if pd.api.types.is_numeric_dtype(y_series):
+        y_vals = y_series.astype(float).tolist()[:5000]
+    else:
+        y_vals = pd.factorize(y_series)[0].tolist()[:5000]
+    task_category = _infer_task_category(y_vals, resolved_target)
+
+    # Encode categoricals so sklearn always sees numeric matrices
+    work_enc = work.copy()
+    for col in work_enc.columns:
+        s = work_enc[col]
+        if pd.api.types.is_numeric_dtype(s):
+            work_enc[col] = s.astype(float)
+        else:
+            work_enc[col] = pd.factorize(s)[0].astype(float)
+
+    rows = work_enc.to_dict("records")
 
     meta = {
-        "target": target,
+        "target": resolved_target,
         "task_category": task_category,
-        "all_features": features,
+        "all_features": feature_cols,
         "display_name": ds.name or f"OpenML #{dataset_id}",
         "description": (ds.description or "")[:200],
     }
@@ -305,49 +314,66 @@ def load_openml(dataset_id: str | int) -> tuple[list[dict], dict]:
 
 
 def load_csv_url(url: str, target: str | None = None) -> tuple[list[dict], dict]:
+    """Download a CSV from a public URL. Returns (rows, metadata).
+
+    Non-numeric columns are label-encoded like OpenML so typical public CSVs work
+    without requiring all-numeric inputs.
+    """
     cache_key = f"csv:{url}:{target}"
     if cache_key in _external_cache:
         return _external_cache[cache_key]
 
-    import requests as req
+    import httpx
+    import pandas as pd
 
-    resp = req.get(url, timeout=60)
+    resp = httpx.get(url, follow_redirects=True, timeout=60)
     resp.raise_for_status()
 
-    text = resp.text
-    reader = csv.DictReader(io.StringIO(text))
-    all_rows = list(reader)
-    if not all_rows:
+    df = pd.read_csv(io.StringIO(resp.text))
+    if df.empty:
         raise ValueError("CSV is empty or could not be parsed")
+    df.columns = [str(c).strip() for c in df.columns]
 
-    numeric = _numeric_columns(all_rows)
-    if not numeric:
-        raise ValueError("CSV has no numeric columns")
+    resolved_target = str(target) if target else str(df.columns[-1])
+    if resolved_target not in df.columns:
+        raise ValueError(
+            f"Target column '{resolved_target}' not found. Columns: {list(df.columns)}"
+        )
 
-    if target and target not in numeric:
-        raise ValueError(f"Target '{target}' is not a numeric column. Numeric columns: {numeric}")
+    feature_cols = [c for c in df.columns if c != resolved_target]
+    if not feature_cols:
+        raise ValueError("No feature columns after selecting target")
 
-    if not target:
-        target = numeric[-1]
+    work = df[feature_cols + [resolved_target]].dropna(how="any")
+    if work.empty:
+        raise ValueError("CSV has no rows after dropping NaNs")
 
-    features = [c for c in numeric if c != target]
-    if not features:
-        raise ValueError("No feature columns remaining after selecting target")
+    if len(work) > MAX_ROWS:
+        work = work.sample(n=MAX_ROWS, random_state=42)
 
-    rows = _coerce_rows_numeric(all_rows, features, target)
+    y_series = work[resolved_target]
+    if pd.api.types.is_numeric_dtype(y_series):
+        y_vals = y_series.astype(float).tolist()[:5000]
+    else:
+        y_vals = pd.factorize(y_series)[0].tolist()[:5000]
+    task_category = _infer_task_category(y_vals, resolved_target)
 
-    if len(rows) > MAX_ROWS:
-        rows = random.sample(rows, MAX_ROWS)
+    work_enc = work.copy()
+    for col in work_enc.columns:
+        s = work_enc[col]
+        if pd.api.types.is_numeric_dtype(s):
+            work_enc[col] = s.astype(float)
+        else:
+            work_enc[col] = pd.factorize(s)[0].astype(float)
 
-    y_vals = [r[target] for r in rows]
-    task_category = _infer_task_category(y_vals, target)
+    rows = work_enc.to_dict("records")
 
     meta = {
-        "target": target,
+        "target": resolved_target,
         "task_category": task_category,
-        "all_features": features,
+        "all_features": feature_cols,
         "display_name": url.split("/")[-1][:60] or "CSV Dataset",
-        "description": f"{len(rows):,} rows, {len(features)} features",
+        "description": f"{len(rows):,} rows, {len(feature_cols)} features",
     }
     _external_cache[cache_key] = (rows, meta)
     return rows, meta
@@ -356,11 +382,114 @@ def load_csv_url(url: str, target: str | None = None) -> tuple[list[dict], dict]
 def load_external_dataset(
     source: str, dataset_id: str, target: str | None = None
 ) -> tuple[list[dict], dict]:
+    """Unified loader that dispatches by source type."""
     if source == "openml":
-        return load_openml(dataset_id)
+        return load_openml(dataset_id, target=target)
     elif source == "csv_url":
         return load_csv_url(dataset_id, target=target)
     elif source == "built_in":
         return get_dataset(dataset_id)
     else:
         raise ValueError(f"Unknown source: {source}")
+
+
+def preview_dataset(
+    source: str, dataset_id: str
+) -> dict:
+    """
+    Fetch just enough info for the frontend preview:
+    columns, row count, sample rows, suggested target + task category.
+    """
+    if source == "built_in":
+        if dataset_id not in DATASETS:
+            raise ValueError(f"Unknown built-in dataset: {dataset_id}")
+        info = DATASETS[dataset_id]
+        cols = info["all_features"] + [info["target"]]
+        return {
+            "columns": cols,
+            "numeric_columns": cols,
+            "target_columns": cols,
+            "row_count": 75_000,
+            "sample_rows": [],
+            "suggested_target": info["target"],
+            "suggested_task_category": info["task_category"],
+            "display_name": info["display_name"],
+        }
+
+    if source == "openml":
+        import openml
+        import pandas as pd
+
+        ds = openml.datasets.get_dataset(
+            int(dataset_id),
+            download_data=True,
+            download_qualities=False,
+            download_features_meta_data=True,
+        )
+        X, y, _, _ = ds.get_data(dataset_format="dataframe")
+        raw_t = ds.default_target_attribute
+        if isinstance(raw_t, (list, tuple)):
+            raw_t = raw_t[0] if raw_t else None
+        target = str(raw_t) if raw_t is not None else str(X.columns[-1])
+        X = X.rename(columns={c: str(c) for c in X.columns})
+        target = str(target)
+        if target not in X.columns:
+            X = X.copy()
+            X[target] = y
+        numeric = list(X.select_dtypes(include=["number"]).columns)
+        if target not in numeric:
+            numeric.append(target)
+        all_cols = [str(c) for c in X.columns]
+        sample = X.head(5).to_dict("records")
+        y_series = X[target].dropna()
+        if pd.api.types.is_numeric_dtype(y_series):
+            y_vals = y_series.astype(float).tolist()[:5000]
+        else:
+            y_vals = pd.factorize(y_series)[0].tolist()[:5000]
+        task_cat = _infer_task_category(y_vals, target)
+        return {
+            "columns": all_cols,
+            "numeric_columns": numeric,
+            "target_columns": all_cols,
+            "row_count": len(X),
+            "sample_rows": sample,
+            "suggested_target": target,
+            "suggested_task_category": task_cat,
+            "display_name": ds.name or f"OpenML #{dataset_id}",
+        }
+
+    if source == "csv_url":
+        import httpx
+        import pandas as pd
+
+        resp = httpx.get(dataset_id, follow_redirects=True, timeout=60)
+        resp.raise_for_status()
+        df = pd.read_csv(io.StringIO(resp.text))
+        if df.empty:
+            raise ValueError("CSV is empty")
+        df.columns = [str(c).strip() for c in df.columns]
+        all_cols = list(df.columns)
+        numeric = list(df.select_dtypes(include=["number"]).columns)
+        suggested_target = str(all_cols[-1])
+        y_series = df[suggested_target].dropna()
+        if len(y_series):
+            if pd.api.types.is_numeric_dtype(y_series):
+                y_vals = y_series.astype(float).tolist()[:5000]
+            else:
+                y_vals = pd.factorize(y_series)[0].tolist()[:5000]
+            task_cat = _infer_task_category(y_vals, suggested_target)
+        else:
+            task_cat = "regression"
+        sample = df.head(5).to_dict("records")
+        return {
+            "columns": all_cols,
+            "numeric_columns": numeric,
+            "target_columns": all_cols,
+            "row_count": len(df),
+            "sample_rows": sample,
+            "suggested_target": suggested_target,
+            "suggested_task_category": task_cat,
+            "display_name": dataset_id.split("/")[-1][:60] or "CSV",
+        }
+
+    raise ValueError(f"Unknown source: {source}")

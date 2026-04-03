@@ -15,7 +15,7 @@ cp config.json.example config.json
 python run.py
 ```
 
-**GUI (browser):** `python app.py` — opens a local dashboard on port 7777.
+**GUI (browser):** `python app.py` — opens http://127.0.0.1:7777. The dashboard polls server state every second (no stale cache). Use **Stop Worker** before exiting so status, uptime, and the activity log stay aligned with the engine.
 
 ## Config
 
@@ -32,7 +32,7 @@ Copy `config.json.example` to `config.json` and set:
 
 - Python 3.10+
 - Network access to the DCN server
-- Dependencies listed in `requirements.txt` (scikit-learn, OpenML for ML jobs, etc.)
+- Dependencies listed in `requirements.txt` (scikit-learn, pandas, OpenML, httpx for ML / remote CSV jobs, etc.)
 
 ## Sync with the main project
 
